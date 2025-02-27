@@ -1,12 +1,15 @@
+// File: GeminiAPIService.java
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class GeminiAPIService {
-    private static final String API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent";
+    private static final String API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-2:generateContent";
     private String apiKey;
     
     public GeminiAPIService(String apiKey) {
@@ -65,12 +68,22 @@ public class GeminiAPIService {
                     new InputStreamReader(connection.getInputStream(), StandardCharsets.UTF_8))) {
                 String responseLine;
                 while ((responseLine = br.readLine()) != null) {
-                    response.append(responseLine.trim());
+                    response.append(responseLine);
                 }
             }
-            return response.toString();
+            return extractTextFromResponse(response.toString());
         } else {
-            throw new Exception("API call failed with status code: " + responseCode);
+            // Handle error response
+            StringBuilder errorResponse = new StringBuilder();
+            try (BufferedReader br = new BufferedReader(
+                    new InputStreamReader(connection.getErrorStream(), StandardCharsets.UTF_8))) {
+                String responseLine;
+                while ((responseLine = br.readLine()) != null) {
+                    errorResponse.append(responseLine);
+                }
+            }
+            throw new Exception("API call failed with status code: " + responseCode + 
+                               "\nError details: " + errorResponse.toString());
         }
     }
     
@@ -82,22 +95,158 @@ public class GeminiAPIService {
                     .replace("\t", "\\t");
     }
     
-    // Helper method to extract text from Gemini API response
+    // Improved method to extract text from Gemini API response
     public String extractTextFromResponse(String apiResponse) {
         try {
-            // Simple extraction - in production you should use a proper JSON parser
-            int textStartIndex = apiResponse.indexOf("\"text\":\"") + 8;
-            int textEndIndex = apiResponse.indexOf("\"}", textStartIndex);
+            // Use a more robust regex pattern to extract text content
+            // This handles the nested JSON structure and properly deals with escaped quotes
+            Pattern pattern = Pattern.compile("\"text\":\\s*\"((?:\\\\.|[^\\\\\"])*?)\"");
+            Matcher matcher = pattern.matcher(apiResponse);
             
-            if (textStartIndex > 8 && textEndIndex > textStartIndex) {
-                return apiResponse.substring(textStartIndex, textEndIndex)
-                                 .replace("\\n", "\n")
-                                 .replace("\\\"", "\"");
+            StringBuilder result = new StringBuilder();
+            while (matcher.find()) {
+                String matchedText = matcher.group(1);
+                // Unescape JSON string escapes
+                String unescaped = matchedText
+                    .replace("\\n", "\n")
+                    .replace("\\r", "\r")
+                    .replace("\\t", "\t")
+                    .replace("\\\"", "\"")
+                    .replace("\\\\", "\\");
+                    
+                result.append(unescaped);
+            }
+            
+            if (result.length() > 0) {
+                return result.toString();
             } else {
-                return "Failed to parse API response.";
+                // Fallback to more complex JSON parsing if regex doesn't find matches
+                // This is a simplified parsing approach for specific Gemini API response format
+                int candidatesStart = apiResponse.indexOf("\"candidates\"");
+                if (candidatesStart >= 0) {
+                    int contentStart = apiResponse.indexOf("\"content\"", candidatesStart);
+                    if (contentStart >= 0) {
+                        int partsStart = apiResponse.indexOf("\"parts\"", contentStart);
+                        if (partsStart >= 0) {
+                            int textStart = apiResponse.indexOf("\"text\"", partsStart);
+                            if (textStart >= 0) {
+                                int valueStart = apiResponse.indexOf("\"", textStart + 7) + 1;
+                                int valueEnd = findMatchingQuoteEnd(apiResponse, valueStart);
+                                
+                                if (valueEnd > valueStart) {
+                                    String extractedText = apiResponse.substring(valueStart, valueEnd);
+                                    return extractedText
+                                        .replace("\\n", "\n")
+                                        .replace("\\r", "\r")
+                                        .replace("\\t", "\t")
+                                        .replace("\\\"", "\"")
+                                        .replace("\\\\", "\\");
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                return "Failed to extract text from API response. Response format might have changed.";
             }
         } catch (Exception e) {
-            return "Error processing API response: " + e.getMessage();
+            return "Error processing API response: " + e.getMessage() + 
+                   "\nResponse received: " + apiResponse.substring(0, Math.min(100, apiResponse.length())) + "...";
         }
+    }
+    
+    // Helper method to find the end of a JSON string value considering escaped quotes
+    private int findMatchingQuoteEnd(String json, int startPos) {
+        for (int i = startPos; i < json.length(); i++) {
+            // If we find a backslash, skip the next character as it's escaped
+            if (json.charAt(i) == '\\') {
+                i++;
+                continue;
+            }
+            // If we find a quote that's not escaped, it's the end of the string
+            if (json.charAt(i) == '"') {
+                return i;
+            }
+        }
+        return -1; // No matching quote found
+    }
+    
+    // Parse specific sections from the Gemini response for code analysis
+    public CodeAnalysis parseComplexityAnalysis(String analysisText, String language, String code) {
+        CodeAnalysis analysis = new CodeAnalysis(language, code);
+        
+        // Extract time complexity
+        Pattern timePattern = Pattern.compile("(?i)Time\\s+Complexity\\s*:?\\s*([^\\n]+)");
+        Matcher timeMatcher = timePattern.matcher(analysisText);
+        if (timeMatcher.find()) {
+            analysis.setTimeComplexity(timeMatcher.group(1).trim());
+        } else {
+            analysis.setTimeComplexity("Not specified");
+        }
+        
+        // Extract space complexity
+        Pattern spacePattern = Pattern.compile("(?i)Space\\s+Complexity\\s*:?\\s*([^\\n]+)");
+        Matcher spaceMatcher = spacePattern.matcher(analysisText);
+        if (spaceMatcher.find()) {
+            analysis.setSpaceComplexity(spaceMatcher.group(1).trim());
+        } else {
+            analysis.setSpaceComplexity("Not specified");
+        }
+        
+        // Extract explanation (everything else)
+        String timeSection = "Time Complexity";
+        String spaceSection = "Space Complexity";
+        String explanationSection = "Explanation";
+        
+        int explanationStart = -1;
+        
+        // Try to find an Explanation section
+        int explicitExplanationStart = analysisText.indexOf(explanationSection);
+        if (explicitExplanationStart >= 0) {
+            // Find the colon or newline after "Explanation"
+            int colonPos = analysisText.indexOf(":", explicitExplanationStart);
+            int newlinePos = analysisText.indexOf("\n", explicitExplanationStart);
+            
+            if (colonPos >= 0 && (newlinePos < 0 || colonPos < newlinePos)) {
+                explanationStart = colonPos + 1;
+            } else if (newlinePos >= 0) {
+                explanationStart = newlinePos + 1;
+            }
+        }
+        
+        // If no explicit Explanation section, try to infer it after Time and Space sections
+        if (explanationStart < 0) {
+            int timePos = analysisText.indexOf(timeSection);
+            int spacePos = analysisText.indexOf(spaceSection);
+            
+            if (timePos >= 0 && spacePos >= 0) {
+                // Find which section comes later
+                int laterSection = Math.max(timePos, spacePos);
+                
+                // Find the end of that section (next newline after the complexity value)
+                int sectionValueEnd = analysisText.indexOf("\n", laterSection + 20); // Approximate position
+                
+                if (sectionValueEnd >= 0) {
+                    explanationStart = sectionValueEnd + 1;
+                }
+            }
+        }
+        
+        // If we found a start position for explanation
+        if (explanationStart >= 0) {
+            analysis.setExplanation(analysisText.substring(explanationStart).trim());
+        } else {
+            // Fallback: Just use the whole text as explanation
+            analysis.setExplanation(analysisText);
+        }
+        
+        return analysis;
+    }
+    
+    // Parse optimization suggestions
+    public String parseOptimizationSuggestions(String optimizationText) {
+        // For optimization text, we usually just want to return the entire response
+        // since it's already structured by the AI model
+        return optimizationText.trim();
     }
 }
